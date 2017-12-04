@@ -1,6 +1,8 @@
 #cython: cdivision=True, boundscheck=False, wraparound=False, embedsignature=True, language_level=3
 from __future__ import division
 
+import sys
+
 cimport cython
 from cython cimport parallel
 cimport cython
@@ -8,9 +10,7 @@ cimport cython
 import numpy as np
 cimport numpy as np
 
-from libc.math cimport log, sqrt, floor
-
-import matplotlib.pyplot as plt
+from libc.math cimport sqrt, floor
 
 ctypedef np.int8_t int8
 
@@ -33,11 +33,9 @@ cdef np.float64_t[:, ::1] apc_correction(const np.float64_t[:, ::1] matrix, N):
     return corrected
 
 
-cdef np.float64_t _compute_theta(int8[:, ::1] ZZ, int N, int M, int num_threads):
+cdef np.float64_t _compute_theta(int8[::1, :] ZZ, int N, int M, int num_threads, np.float64_t[::1] meanfracid_arr) nogil:
     cdef np.float64_t fracid = 0.0
     cdef np.float64_t meanfracid = 0.0
-    cdef np.float64_t[::1] meanfracid_arr
-    meanfracid_arr = np.zeros(M-1, dtype=np.float64)
 
     cdef np.float64_t nids
     cdef Py_ssize_t i, j, k
@@ -48,16 +46,17 @@ cdef np.float64_t _compute_theta(int8[:, ::1] ZZ, int N, int M, int num_threads)
             for k in range(N):
                 nids = nids + (ZZ[k,i] == ZZ[k,j])
             fracid = nids / N
-            meanfracid_arr[i] = meanfracid_arr[i] + fracid
+            meanfracid_arr[i] += fracid
 
-    meanfracid = np.sum(meanfracid_arr)
+    for i in range(M-1):
+        meanfracid += meanfracid_arr[i]
     meanfracid /= 0.5 * M * (M-1)
     cdef np.float64_t theta = min(0.5, 0.38 * 0.32 / meanfracid)
     return theta
 
 
 
-cdef np.float64_t _compute_weights(int8[:, ::1] ZZ, np.float64_t theta, int N, int M, int num_threads,
+cdef np.float64_t _compute_weights(int8[::1, :] ZZ, np.float64_t theta, int N, int M, int num_threads,
                             np.float64_t[::1] W) nogil:
                             #np.float64_t[::1] W):
     cdef np.float64_t Meff = 0.0
@@ -79,14 +78,17 @@ cdef np.float64_t _compute_weights(int8[:, ::1] ZZ, np.float64_t theta, int N, i
             while _dist < _thresh and k < N:
                 _dist = _dist + (ZZ[k,i] != ZZ[k,j])
                 k = k + 1
-            if _dist < _thresh:
-                W[i] += 1
-                W[j] += 1
+            W[i] += 1 * (_dist < _thresh)
+            W[j] += 1 * (_dist < _thresh)
+            # Optimization: use implicit boolean test instead of explicit if branch
+            #if _dist < _thresh:
+            #    W[i] += 1
+            #    W[j] += 1
+
     for i in range(M):
         W[i] = 1./W[i]
         Meff += W[i]
     return Meff
-
 
 
 cdef void _compute_freqs(int8[:, ::1] Z, int8 q, np.float64_t[::1] W, np.float64_t Meff, int num_threads,
@@ -103,8 +105,6 @@ cdef void _compute_freqs(int8[:, ::1] Z, int8 q, np.float64_t[::1] W, np.float64
     Pi[:] = 0.0
 
     cdef Py_ssize_t i0, j0, i, j, k
-    cdef int8[::1] _Zi
-    cdef int8[::1] _Zj
     cdef int8 a, b
     
 
@@ -112,9 +112,10 @@ cdef void _compute_freqs(int8[:, ::1] Z, int8 q, np.float64_t[::1] W, np.float64
         i0 = i * s
         for k in range(M):
             a = Z[i,k]
-            if a == q:
-                continue
-            Pi[i0 + a - 1] += W[k]
+            # Optimization: use implicit boolean test instead of explicit if branch
+            #if a == q:
+            #    continue
+            Pi[i0 + a - 1] += W[k] * (a != q)
 
     for i in parallel.prange(N, num_threads=num_threads, schedule='static', nogil=True):
         i0 = i * s
@@ -123,9 +124,10 @@ cdef void _compute_freqs(int8[:, ::1] Z, int8 q, np.float64_t[::1] W, np.float64
             for k in range(M):
                 a = Z[i,k]
                 b = Z[j,k]
-                if a == q or b == q:
-                    continue
-                Pij[i0 + a - 1, j0 + b - 1] += W[k]
+                # Optimization: use implicit boolean test instead of explicit if branch
+                #if a == q or b == q:
+                #    continue
+                Pij[i0 + a - 1, j0 + b - 1] += W[k] * (a != q) * (b != q)
             j0 = j0 + s
  
     for i in parallel.prange(Ns, num_threads=num_threads, schedule='static', nogil=True):
@@ -144,9 +146,15 @@ cdef void _compute_new_frequencies(int8[:, ::1] alignment, int8 q, np.float64_t 
                                     np.float64_t Meff):
     cdef Py_ssize_t N = alignment.shape[0]
     cdef Py_ssize_t M = alignment.shape[1]
-    theta = _compute_theta(alignment, N, M, num_threads)
+    cdef np.float64_t[::1] meanfracid_arr
+    meanfracid_arr = np.zeros(M-1, dtype=np.float64)
+
+    # Optimization: use row-major alignment representation to match access pattern
+    cdef int8 [::1, :] alignment_f = np.copy(alignment, order='f')
+    assert(np.array_equal(alignment, alignment_f))
+    theta = _compute_theta(alignment_f, N, M, num_threads, meanfracid_arr)
     print("theta = %s threshold = %s" % (theta, floor(theta*N)))
-    Meff = _compute_weights(alignment, theta, N, M, num_threads, W)
+    Meff = _compute_weights(alignment_f, theta, N, M, num_threads, W)
     print("M = %s N = %s Meff = %s" % (M, N, Meff))
     _compute_freqs(alignment, q, W, Meff, num_threads, Pi_true, Pij_true)
 
@@ -259,9 +267,15 @@ def compute_gdca_scores(alignment, num_threads=1):
     C = Pij_np - (Pi_np * Pi_np.T)
 
     # invert it
+    #try:
     R = np.linalg.inv(np.linalg.cholesky(C))
     mJ_np = np.dot(R.T, R)
-    #mJ_np = np.linalg.inv(C)
+    #except np.linalg.linalg.LinAlgError:
+    #    sys.stderr.write("Cholesky inversion failed, trying np.inv instead.\n")
+    #    try:
+    #        mJ_np = np.linalg.inv(C)
+    #    except:
+    #        raise
 
     cdef np.float64_t[:, ::1] mJ = mJ_np
 
